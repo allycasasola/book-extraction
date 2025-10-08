@@ -8,17 +8,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# TODO: Provide an ISBN tool search
-# TODO: Feed first 4000 words to the model and the last 2000 words to the model; this should improve performance on ISBN retrieval as many ISBNs are found in the last words
 # 30 words per page * 20 pages = 6000 words
-MAX_WORD_COUNT = 6000
+MAX_FIRST_WORD_COUNT = 4000
+MAX_LAST_WORD_COUNT = 2000
 DEFAULT_MODEL = "gpt-5"
 DEFAULT_DATA_DIR = f"{os.getenv('DATA_DIR')}/run-books"
 DEFAULT_OUTPUT_FILE = f"{os.getenv('DATA_DIR')}/extracted_info.jsonl"
 
 
 SYSTEM_PROMPT = """
-You are a helpful assistant for bibliographic metadata extraction. You will be provided the opening pages or the first text of a specific manifestation of a book. This text may include the title page, copyright page, preface, or introduction. From this text, extract, reason, research, and retrieve the following information as accurately as possible.
+You are a helpful assistant for bibliographic metadata extraction. You will be provided the first 4,000 words and the last 2,000 words of a specific manifestation of a book. This first 4,000 words may include the title page, copyright page, preface, or introduction. The last 2,000 words may include the conclusion, appendix, afterword, credits, bibliography, or other relevant information. From this text, extract, reason, research, and retrieve the following information as accurately as possible.
 - Main title: the book's main title (excluding the series name, edition notes, or subtitle, unless part of the main title)
 - Subtitle: the book's subtitle (if any)
 - Series: the book's series (if any)
@@ -33,10 +32,10 @@ You are a helpful assistant for bibliographic metadata extraction. You will be p
 Rules and disambiguation guidelines:
 - Use only the provided text plus cautious web search if the text is insufficient. If a field cannot be determined with high confidence, set it to null.
 - For ISBN-13 and ISBN-10, do not include the dashes.
+- If you can determine the ISBN-13, set the ISBN-10 to null. If you cannot determine the ISBN-13, set the ISBN-13 to null, and look for the ISBN-10. If you cannot find neither, set both to null.
 - If there are multiple authors, separate them with commas.
 - If there are multiple translators, separate them with commas.
 - If there are multiple publishers, separate them with semicolons.
-- If you are unable to decide which manifestation of a book the text is referring to, set the ISBNs to the earliest year of publication and the earliest publisher(s) for the book.
 - Never make up information. Only use the information provided in the text and the information retrieved from the web search.
 """
 
@@ -69,12 +68,24 @@ class BookInfo(BaseModel):
     publisher: str | None
 
 
-def retrieve_info(file_path, model, max_word_count, output_file):
+def get_text(text, max_first_word_count, max_last_word_count):
+    new_text = ""
+    new_text += "START OFBEGINNING TEXT:\n"
+    new_text += text[:max_first_word_count]
+    new_text += "END OF BEGINNING TEXT\n"
+    new_text +=  "START OF FINAL TEXT:\n"
+    new_text += text[-max_last_word_count:]
+    new_text += "END OF FINAL TEXT\n"
+    return new_text
+
+def retrieve_info(file_path, model, max_first_word_count, max_last_word_count, output_file):
     with open(file_path, "r") as f:
         text = f.read()
-    words = text.split()
-    if len(words) > max_word_count:
-        text = " ".join(words[:max_word_count])
+    text = get_text(text, max_first_word_count, max_last_word_count)
+
+    if len(text) > 6085: # 6000 words + 85 words for the start and end markers
+        print(f"Text is too long: {len(text)} words")
+        return
 
     response = client.responses.parse(
         model=model,
@@ -104,14 +115,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", "-d", type=str, default=DEFAULT_DATA_DIR)
     parser.add_argument("--model", "-m", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--max_word_count", "-w", type=int, default=MAX_WORD_COUNT)
+    parser.add_argument("--max_first_word_count", "-f", type=int, default=MAX_FIRST_WORD_COUNT)
+    parser.add_argument("--max_last_word_count", "-l", type=int, default=MAX_LAST_WORD_COUNT)
     parser.add_argument("--output_file", "-o", type=str, default=DEFAULT_OUTPUT_FILE)
     parser.add_argument("--start_index", "-s", type=int, default=0)
     args = parser.parse_args()
 
     data_dir = args.data_dir
     model = args.model
-    max_word_count = args.max_word_count
+    max_first_word_count = args.max_first_word_count
+    max_last_word_count = args.max_last_word_count
     output_file = args.output_file
     start_index = args.start_index
     cur_index = 0
@@ -119,7 +132,7 @@ def main():
         print(f"Current index: {cur_index}")
         if file.endswith(".txt") and cur_index >= start_index:
             file_path = os.path.join(data_dir, file)
-            retrieve_info(file_path, model, max_word_count, output_file)
+            retrieve_info(file_path, model, max_first_word_count, max_last_word_count, output_file)
         elif file.endswith(".txt"):
             print(f"Skipping {file}...")
         cur_index += 1
