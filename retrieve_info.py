@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 import random
 import requests
 from datetime import date
+from dateutil import parser as date_parser
+import re
 
 load_dotenv()
 
@@ -32,7 +34,7 @@ You are a helpful assistant for bibliographic metadata extraction. You will be p
 - Translator: the translator(s) (if any)
 - ISBN-13: the ISBN-13 of the book
 - ISBN-10: the ISBN-10 of the book
-- Year of publication: the year that the book was published
+- Publication date: the date that the book was published
 - Status: the copyright or licensing status of the book (e.g. "all rights reserved", "public domain", "cc-by", "cc-by-nc-sa", "cc-by-nd", "cc0", "orphan work", "government work", "fair use")
 - Publisher: the name of the publisher of the book
 
@@ -44,9 +46,32 @@ Rules and disambiguation guidelines:
 - If there are multiple translators found in the text, separate them with commas.
 - If there are multiple publishers found in the text, separate them with semicolons.
 - Never make up information. Only use the information provided in the text.
+- If you can only determine the year of publication from the text, set the publication date to the first day of that year.
 """
 
-WORK_FIELDS = "title,author_key,author_name,author_alternative_name,first_publish_year,publish_date,publish_year"
+WORK_FIELDS = "title,author_key,author_name,author_alternative_name,first_publish_year,publish_date,publish_year,key"
+
+
+def _fetch_all_author_names(author_keys: list[str]) -> list[str]:
+    """Fetch all author names (including alternative names) for given author keys."""
+
+    author_names = []
+    for author_key in author_keys:
+        url = f"https://openlibrary.org/authors/{author_key}.json"
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                author_data = response.json()
+                # Add primary name
+                if "name" in author_data:
+                    author_names.append(author_data["name"])
+                # Add alternative names
+                if "alternate_names" in author_data:
+                    author_names.extend(author_data["alternate_names"])
+        except Exception as e:
+            print(f"Error fetching author names for {author_key}: {e}")
+    return author_names
+
 
 # TODO: Add a retry mechanism
 def _fetch_works(title: str, author: str) -> dict | None:
@@ -55,37 +80,34 @@ def _fetch_works(title: str, author: str) -> dict | None:
         "title": title,
         "author": author,
     }
-    title = urllib.parse.quote(title)
-    author = urllib.parse.quote(author)
     # Limit to only 100 results max
-    url= f"https://openlibrary.org/search/works.json?{urlencode(params)}&fields={WORK_FIELDS}&limit=100"
+    url = f"https://openlibrary.org/search.json?{urlencode(params)}&fields={WORK_FIELDS}&limit=100"
     response = requests.get(url)
     return response.json()
 
 
 def _parse_edtf_date(edtf_date: str) -> date | None:
+    """Parse various date formats from OpenLibrary."""
     try:
-        parts = edtf_date.split("-")
-        year = int(parts[0])
-        month = int(parts[1]) if len(parts) > 1 else 1
-        day = int(parts[2]) if len(parts) > 2 else 1
-        return date(year, month, day)
+        # Try to parse using dateutil which handles many formats
+        parsed_date = date_parser.parse(edtf_date, fuzzy=True)
+        return parsed_date.date()
     except Exception as e:
-        print(f"Error parsing EDTF date: {e}")
+        # Fallback: try to extract just the year
+        try:
+            # Look for a 4-digit year
+            year_match = re.search(r"\b(1\d{3}|20\d{2})\b", edtf_date)
+            if year_match:
+                year = int(year_match.group(1))
+                return date(year, 1, 1)
+        except Exception:
+            pass
+
+        print(f"Error parsing date '{edtf_date}': {e}")
         return None
 
 
-def _fetch_all_author_names(author_key: str) -> list[str]:
-    url= f"https://openlibrary.org/authors/{author_key}.json"
-    response = requests.get(url)
-    all_names = response.json()["name"]
-    all_names.extend(response.json()["alternate_names"])
-    all_names.extend(response.json()["fuller_name"])
-    all_names.extend(response.json()["personal_name"])
-    return all_names
-
-
-def filter_works(title: str, author: str) -> list[dict] | None:
+def fetch_and_filter_works(title: str, author: str) -> list[dict] | None:
     works = _fetch_works(title, author)
     works_filtered = []
     if works is None or works["numFound"] == 0:
@@ -93,33 +115,39 @@ def filter_works(title: str, author: str) -> list[dict] | None:
     # Filter works whose title/alternative_title matches the title (case insensitive) AND author_name/alternative_name matches the author (case insensitive)
     for work in works["docs"]:
         author_names = _fetch_all_author_names(work["author_key"])
-        if work["title"].lower() == title.lower() and any(author_name.lower() == author.lower() for author_name in author_names):
+        if work["title"].lower() == title.lower() and any(
+            author_name.lower() == author.lower() for author_name in author_names
+        ):
             works_filtered.append(work)
     return works_filtered
 
 
-def _find_work_key_with_earliest_publication_year(works: list[dict]) -> str | None:
-    earliest_publication_year = float('inf')
+def find_work_key_with_earliest_publication_year(works: list[dict]) -> str | None:
+    earliest_publication_year = float("inf")
     earliest_work = None
     for work in works:
         if work["first_publish_year"] < earliest_publication_year:
             earliest_publication_year = work["first_publish_year"]
             earliest_work = work
-    return earliest_work["key"]
+    # Remove the "/works/" prefix from the work key
+    return earliest_work["key"].replace("/works/", "")
 
 
 def fetch_all_editions(work_key: str) -> list[dict]:
-    url= f"https://openlibrary.org/works/{work_key}/editions.json"
+    url = f"https://openlibrary.org/works/{work_key}/editions.json"
     response = requests.get(url)
     return response.json()["entries"]
 
 
-def _find_edition_with_earliest_publication(editions: list[dict]) -> dict | None:
+def find_edition_with_earliest_publication(editions: list[dict]) -> dict | None:
     earliest_publication_date = date(9999, 12, 31)
     earliest_edition = None
     for edition in editions:
         publication_date = _parse_edtf_date(edition["publish_date"])
-        if publication_date is not None and publication_date < earliest_publication_date:
+        if (
+            publication_date is not None
+            and publication_date < earliest_publication_date
+        ):
             earliest_publication_date = publication_date
             earliest_edition = edition
     return earliest_edition
@@ -138,29 +166,38 @@ StatusType = Literal[
 ]
 
 
-class OpenAIUsage():
-    input_tokens: int
-    output_tokens: int
-    num_books: int
-
-
-class OverallBookMetadata():
-    version_specific_book_metadata: BookMetadata | None
-    original_book_metadata: BookMetadata | None
-
-
 class BookMetadata(BaseModel):
-    filename: str | None
-    title: str | None
-    subtitle: str | None
-    series: str | None
-    author: str | None
-    translator: str | None
-    isbn_13: str | None
-    isbn_10: str | None
-    year_of_publication: int | None
-    status: StatusType | None
-    publisher: str | None
+    translator: str | None = None
+    isbn_13: str | None = None
+    isbn_10: str | None = None
+    publication_date: date | None = None
+    status: StatusType | None = None
+    publisher: str | None = None
+
+
+class ChatGPTExtraction(BaseModel):
+    """Model for initial extraction from ChatGPT."""
+
+    title: str | None = None
+    subtitle: str | None = None
+    series: str | None = None
+    author: str | None = None
+    translator: str | None = None
+    isbn_13: str | None = None
+    isbn_10: str | None = None
+    publication_date: date | None = None
+    status: StatusType | None = None
+    publisher: str | None = None
+
+
+class OverallBookMetadata(BaseModel):
+    filename: str | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    series: str | None = None
+    author: str | None = None
+    books3_version_metadata: BookMetadata | None = None
+    original_version_metadata: BookMetadata | None = None
 
 
 def format_text(text, max_first_word_count, max_last_word_count):
@@ -177,6 +214,12 @@ def format_text(text, max_first_word_count, max_last_word_count):
 def retrieve_metadata(
     file_path, model, max_first_word_count, max_last_word_count, output_file, debug
 ):
+    """
+    Step 1: Create OverallBookMetadata instance
+    Step 2: Extract title, subtitle, series, author, and books3_version_metadata using ChatGPT
+    Step 3: Using title and author, get original_version_metadata from OpenLibrary API
+    """
+    # Read and format the text
     with open(file_path, "r") as f:
         text = f.read()
     text = format_text(text, max_first_word_count, max_last_word_count)
@@ -188,38 +231,126 @@ def retrieve_metadata(
         print(f"Text is too long: {len(text)} words. Skipping...")
         return
 
+    # Step 2: Extract metadata using ChatGPT
+    print(f"Extracting metadata from {file_path} using ChatGPT...")
     response = OPENAI_CLIENT.responses.parse(
         model=model,
-        tools=[
-            {
-                "type": "web_search",
-            }
-        ],
         input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text},
         ],
-        text_format=BookMetadata,
+        text_format=ChatGPTExtraction,
     )
 
     if hasattr(response, "usage"):
+        # TODO: Track usage
         input_tokens = getattr(response.usage, "input_tokens", 0)
         print(f"Input tokens: {input_tokens}")
         output_tokens = getattr(response.usage, "output_tokens", 0)
         print(f"Output tokens: {output_tokens}")
 
-    metadata = response.output_parsed
+    extracted = response.output_parsed
+    if debug:
+        print(f"Extracted metadata from ChatGPT: {extracted}")
+    # Step 1: Create OverallBookMetadata instance with extracted info
+    overall_metadata = OverallBookMetadata(
+        filename=os.path.basename(file_path),
+        title=extracted.title,
+        subtitle=extracted.subtitle,
+        series=extracted.series,
+        author=extracted.author,
+        books3_version_metadata=BookMetadata(
+            translator=extracted.translator,
+            isbn_13=extracted.isbn_13,
+            isbn_10=extracted.isbn_10,
+            publication_date=extracted.publication_date,
+            status=extracted.status,
+            publisher=extracted.publisher,
+        ),
+        original_version_metadata=None,  # Will be filled in Step 3
+    )
 
-    # Extract just the filename (without path) and add it to the parsed info
-    filename = os.path.basename(file_path)
-    metadata.filename = filename
+    # Step 3: Get original version metadata from OpenLibrary API
+    if extracted.title and extracted.author:
+        print(f"Fetching original version metadata from OpenLibrary...")
+        try:
+            # 3a: Fetch and filter works
+            works = fetch_and_filter_works(extracted.title, extracted.author)
+            if debug:
+                print(f"Works found: {works}")
+            if works and len(works) > 0:
+                # 3b: Get work key with earliest publication year
+                work_key = find_work_key_with_earliest_publication_year(works)
+                if debug:
+                    print(f"Work key: {work_key}")
 
-    print(f"Retrieved metadata from {file_path}...")
-    print(metadata)
+                if work_key:
+                    breakpoint()
+                    # 3c: Get all editions for this work
+                    editions = fetch_all_editions(work_key)
+                    if debug:
+                        print(f"Editions found: {editions}")
 
+                    if editions and len(editions) > 0:
+                        # 3d: Get edition with earliest publication date
+                        breakpoint()
+                        earliest_edition = find_edition_with_earliest_publication(
+                            editions
+                        )
+                        if debug:
+                            print(f"Earliest edition: {earliest_edition}")
+
+                        if earliest_edition:
+                            # Fill out original_version_metadata from the earliest edition
+                            overall_metadata.original_version_metadata = BookMetadata(
+                                translator=None,  # Translator info not typically in OpenLibrary editions
+                                isbn_13=(
+                                    earliest_edition.get("isbn_13", [None])[0]
+                                    if "isbn_13" in earliest_edition
+                                    and earliest_edition["isbn_13"]
+                                    else None
+                                ),
+                                isbn_10=(
+                                    earliest_edition.get("isbn_10", [None])[0]
+                                    if "isbn_10" in earliest_edition
+                                    and earliest_edition["isbn_10"]
+                                    else None
+                                ),
+                                publication_date=(
+                                    _parse_edtf_date(earliest_edition["publish_date"])
+                                    if "publish_date" in earliest_edition
+                                    and earliest_edition["publish_date"] is not None
+                                    else None
+                                ),
+                                status=None,  # Status info not in OpenLibrary
+                                publisher=(
+                                    ", ".join(earliest_edition.get("publishers", []))
+                                    if "publishers" in earliest_edition
+                                    else None
+                                ),
+                            )
+                            print(
+                                f"Found original version metadata: {overall_metadata.original_version_metadata}"
+                            )
+                        else:
+                            print(f"No edition with valid publication date found")
+                    else:
+                        print(f"No editions found for work {work_key}")
+                else:
+                    print(f"No work key found")
+            else:
+                print(f"No matching works found on OpenLibrary")
+        except Exception as e:
+            print(f"Error fetching from OpenLibrary: {e}")
+    else:
+        print(f"Skipping OpenLibrary lookup - missing title or author")
+
+    # Save to output file
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "a") as f:
-        f.write(metadata.model_dump_json() + "\n")
+        f.write(overall_metadata.model_dump_json() + "\n")
+
+    print(f"Saved metadata for {overall_metadata.filename}\n")
 
 
 def main():
@@ -233,7 +364,7 @@ def main():
         "--max_last_word_count", "-l", type=int, default=MAX_LAST_WORD_COUNT
     )
     parser.add_argument("--output_file", "-o", type=str, default=DEFAULT_OUTPUT_FILE)
-    parser.add_argument("--debug", "-d", type=bool, default=False)
+    parser.add_argument("--debug", type=bool, default=False)
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -256,7 +387,12 @@ def main():
         if file.endswith(".txt"):
             file_path = os.path.join(data_dir, file)
             retrieve_metadata(
-                file_path, model, max_first_word_count, max_last_word_count, output_file, print_text
+                file_path,
+                model,
+                max_first_word_count,
+                max_last_word_count,
+                output_file,
+                debug,
             )
         else:
             print(f"Skipping {file}...")
