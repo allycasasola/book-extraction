@@ -13,32 +13,27 @@ import re
 import json
 import zipfile
 import pandas as pd
-from io import BytesIO
+from fuzzywuzzy import fuzz
+from utils import (
+    StatusType,
+    find_edition_with_earliest_publication,
+    _parse_edtf_date,
+    select_work_keys_for_expansion,
+)
 
 load_dotenv()
 
 # TODO: Add status field
+# TODO: Create a separate file for all classes and functions
 
-DEFAULT_INPUT_FILE = f"{os.getenv('DATA_DIR')}/books3_extracted_info.jsonl"
-DEFAULT_OUTPUT_FILE = f"{os.getenv('DATA_DIR')}/enriched_info.jsonl"
+DEFAULT_INPUT_FILE = f"{os.getenv('DATA_DIR')}/run_books_extracted_info.jsonl"
+DEFAULT_OUTPUT_FILE = f"{os.getenv('DATA_DIR')}/run_books_enriched_info.jsonl"
 
-COPYRIGHT_RENEWALS_DATA_FILE_URL = "https://web.stanford.edu/dept/SUL/collections/copyrightrenewals/files/20170427-copyright-renewals-records.csv.zip"
-
-
+COPYRIGHT_RENEWAL_RECORDS_FILE = (
+    f"{os.getenv('DATA_DIR')}/copyright_renewal_records.csv"
+)
 
 WORK_FIELDS = "title,author_key,author_name,author_alternative_name,first_publish_year,publish_date,publish_year,key"
-
-StatusType = Literal[
-    "all rights reserved",
-    "public domain",
-    "cc-by",
-    "cc-by-nc-sa",
-    "cc-by-nd",
-    "cc0",
-    "orphan work",
-    "government work",
-    "fair use",
-]
 
 
 class BookMetadata(BaseModel):
@@ -60,35 +55,34 @@ class OverallBookMetadata(BaseModel):
     original_version_metadata: BookMetadata | None = None
 
 
-def _fetch_all_author_names(author_keys: list[str], debug: bool = False) -> list[str]:
+def _fetch_all_author_names(author_keys: list[str]) -> list[str]:
     """Fetch all author names (including alternative names) for given author keys."""
     author_names = []
     for author_key in author_keys:
         url = f"https://openlibrary.org/authors/{author_key}.json"
-        if debug:
-            print(f"Fetching author names for {author_key} from {url}")
         try:
             response = requests.get(url)
-            if response.status_code == 200:
-                author_data = response.json()
-                # Add primary name
-                if "name" in author_data:
-                    author_names.append(author_data["name"])
-                # Add alternative names
-                if "alternate_names" in author_data:
-                    author_names.extend(author_data["alternate_names"])
+            response.raise_for_status()
+            author_data = response.json()
+
+            # Add primary name
+            if "name" in author_data:
+                author_names.append(author_data["name"])
+
+            # Add alternative names
+            if "alternate_names" in author_data:
+                author_names.extend(author_data["alternate_names"])
+
         except Exception as e:
-            print(f"Error fetching author names for {author_key}: {e}")
+            continue
+
     return author_names
 
 
-def _fetch_title_and_author_by_isbn(
-    isbn: str, debug: bool = False
-) -> tuple[str, str] | None:
+def _fetch_title_and_author_by_isbn(isbn: str) -> tuple[str, str] | None:
     """Fetch work key by ISBN from OpenLibrary API."""
     url = f"https://openlibrary.org/isbn/{isbn}.json"
-    if debug:
-        print(f"Fetching title and author by ISBN '{isbn}' from {url}")
+    print(f"Fetching title and author by ISBN: {url}")
     response = requests.get(url)
     title = response.json().get("title")
     # author_key should be the first author's key in the format "/authors/{author_key}"
@@ -97,89 +91,103 @@ def _fetch_title_and_author_by_isbn(
     return title, author_name
 
 
-def _fetch_author_name_by_key(author_key: str, debug: bool = False) -> str | None:
+def _fetch_author_name_by_key(author_key: str) -> str | None:
     url = f"https://openlibrary.org/authors/{author_key}.json"
-    if debug:
-        print(f"Fetching author name by key '{author_key}' from {url}")
     response = requests.get(url)
     return response.json().get("name")
 
 
-def _fetch_works(title: str, author: str, debug: bool = False) -> dict | None:
-    """Fetch works from OpenLibrary API."""
-    params = {
-        "title": title,
-        "author": author,
-    }
-    # Limit to only 100 results max
-    url = f"https://openlibrary.org/search.json?{urlencode(params)}&fields={WORK_FIELDS}&limit=100"
-    if debug:
-        print(f"Fetching works from {url}")
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error fetching works: {e}")
-        return None
+def fetch_works(title_variations: list[str], authors: list[str] | None) -> list[dict]:
+    """Fetch works from OpenLibrary API. Try multiple title variations and authors. Return all results."""
+    works = []
+    for i, title_variant in enumerate(title_variations):
+        if authors is not None and len(authors) > 0:
+            for author in authors:
+                params = {
+                    "title": title_variant,
+                    "author": author,
+                }
+                # Limit to only 100 results max
+                url = f"https://openlibrary.org/search.json?{urlencode(params)}&fields={WORK_FIELDS}&limit=100"
+                try:
+                    response = requests.get(url)
+                    response.raise_for_status()
+                    data = response.json()
 
+                    # If we found results, return them
+                    if data.get("numFound", 0) > 0:
+                        # data["docs"] is a list of dictionaries
+                        works.extend(data.get("docs", []))
+                except Exception as e:
+                    continue
 
-def _parse_edtf_date(edtf_date: str, debug: bool = False) -> date | None:
-    """Parse various date formats from OpenLibrary."""
-    try:
-        # First check if it's just a 4-digit year
-        year_only_match = re.match(r"^\s*(\d{4})\s*$", edtf_date)
-        if year_only_match:
-            year = int(year_only_match.group(1))
-            parsed_date = date(year, 1, 1)
-            if debug:
-                print(f"Parsed EDTF date '{edtf_date}' as '{parsed_date}'")
-            return parsed_date
-
-        # Try to parse using dateutil which handles many formats
-        parsed_date = date_parser.parse(edtf_date, fuzzy=True)
-        if debug:
-            print(f"Parsed EDTF date '{edtf_date}' as '{parsed_date}'")
-        return parsed_date.date()
-    except Exception as e:
-        # Fallback: try to extract just the year
+        params = {
+            "title": title_variant,
+        }
+        # Limit to only 100 results max
+        url = f"https://openlibrary.org/search.json?{urlencode(params)}&fields={WORK_FIELDS}&limit=100"
         try:
-            # Look for a 4-digit year
-            year_match = re.search(r"\b(1\d{3}|20\d{2})\b", edtf_date)
-            if year_match:
-                year = int(year_match.group(1))
-                return date(year, 1, 1)
-        except Exception:
-            pass
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
 
-        print(f"Error parsing date '{edtf_date}': {e}")
-        return None
+        except Exception as e:
+            continue
+    return works
 
 
-def fetch_and_filter_works(
-    title: str, author: str, debug: bool = False
-) -> list[dict] | None:
+def filter_works(
+    works: list[dict],
+    title_variations: list[str],
+    authors: list[str],
+) -> list[dict]:
     """Fetch and filter works that match the title and author."""
-    works = _fetch_works(title, author, debug)
     works_filtered = []
-    if works is None or works.get("numFound", 0) == 0:
-        return None
     # Filter works whose title matches exactly (case insensitive)
     # AND author_name/alternative_name matches the author (case insensitive)
-    for work in works["docs"]:
-        if "author_key" not in work:
-            continue
-        author_names = _fetch_all_author_names(work["author_key"])
-        if work["title"].lower() == title.lower() and any(
-            author_name.lower() == author.lower() for author_name in author_names
+    for work in works:
+        openlibrary_author_names = []
+        if (
+            "author_key" not in work
+            and "author_name" not in work
+            and "author_alternative_name" not in work
         ):
+            continue
+        if "author_key" in work:
+            openlibrary_author_names.extend(_fetch_all_author_names(work["author_key"]))
+        if "author_name" in work:
+            openlibrary_author_names.extend(work["author_name"])
+        if "author_alternative_name" in work:
+            openlibrary_author_names.extend(work["author_alternative_name"])
+        openlibrary_author_names = list(set(openlibrary_author_names))
+
+        # Hack to handle titles like, "Sunburn: A Novel"
+        openlibrary_titles = (
+            [work["title"], work["title"].split(":")[0]]
+            if ":" in work["title"]
+            else [work["title"]]
+        )
+        # Try any combination of author_name and author
+        # Use token_set_ratio to handle titles with extra words like "and Other Essays"
+        title_match = any(
+            fuzz.token_set_ratio(ol_title.lower(), title_variation.lower()) > 85
+            for ol_title in openlibrary_titles
+            for title_variation in title_variations
+        )
+
+        # For author matching, check for exact match (case-insensitive)
+        author_match = any(
+            ol_author_name.lower() == author.lower()
+            for ol_author_name in openlibrary_author_names
+            for author in authors
+        )
+
+        if title_match and author_match:
             works_filtered.append(work)
-    return works_filtered if works_filtered else None
+    return works_filtered
 
 
-def find_work_keys_with_earliest_publication_year(
-    works: list[dict], debug: bool = False
-) -> list[str]:
+def find_work_keys_with_earliest_publication_year(works: list[dict]) -> list[str]:
     """Find all work keys with the earliest publication year.
 
     Returns:
@@ -207,21 +215,12 @@ def find_work_keys_with_earliest_publication_year(
         ):
             earliest_works.append(work)
 
-    if debug:
-        print(
-            f"Found {len(earliest_works)} work(s) with earliest publication year {earliest_publication_year}"
-        )
-        for work in earliest_works:
-            print(f"  - {work.get('key', 'unknown')}")
-
     # Remove the "/works/" prefix from all work keys
     work_keys = [work["key"].replace("/works/", "") for work in earliest_works]
     return work_keys
 
 
-def fetch_all_editions(
-    work_key: str, max_limit: int = 2000, debug: bool = False
-) -> list[dict]:
+def fetch_all_editions(work_key: str, max_limit: int = 2000) -> list[dict]:
     """Fetch all editions for a given work.
 
     This function makes two API calls:
@@ -237,41 +236,26 @@ def fetch_all_editions(
         List of edition dictionaries
     """
     base_url = f"https://openlibrary.org/works/{work_key}/editions.json"
-
     try:
         # First call: Get the total size
-        if debug:
-            print(f"Fetching edition count from {base_url}")
         response = requests.get(base_url)
         response.raise_for_status()
         data = response.json()
         total_size = data.get("size", 0)
 
         if total_size == 0:
-            if debug:
-                print("No editions found")
             return []
 
         # Limit the request size for safety
         limit = min(total_size, max_limit)
 
-        if debug:
-            print(f"Total editions available: {total_size}")
-            if total_size > max_limit:
-                print(f"Limiting request to {max_limit} editions for safety")
-
         # Second call: Fetch all editions with the appropriate limit
         url_with_limit = f"{base_url}?limit={limit}"
-        if debug:
-            print(f"Fetching {limit} editions from {url_with_limit}")
 
         response = requests.get(url_with_limit)
         response.raise_for_status()
         data = response.json()
         entries = data.get("entries", [])
-
-        if debug:
-            print(f"Successfully fetched {len(entries)} editions")
 
         return entries
 
@@ -280,54 +264,51 @@ def fetch_all_editions(
         return []
 
 
-def find_edition_with_earliest_publication(
-    editions: list[dict], debug: bool = False
-) -> dict | None:
-    """Find the edition with the earliest publication date."""
-    print(
-        f"Finding edition with earliest publication date from {len(editions)} editions"
-    )
-    earliest_publication_date = date(9999, 12, 31)
-    earliest_editions = []
-    for edition in editions:
-        if debug:
-            print(f"Checking edition: ")
-            print(edition)
-        if "publish_date" not in edition:
-            continue
-        publication_date = _parse_edtf_date(edition["publish_date"], debug)
-        if publication_date is None:
-            continue
-        # If the publication date shares the same year as the earliest publication date, add it to the list
-        if publication_date.year == earliest_publication_date.year:
-            earliest_editions.append(edition)
-        # If the publication date is before the earliest publication date, replace the list with the new edition
-        elif publication_date < earliest_publication_date:
-            earliest_publication_date = publication_date
-            earliest_editions = [edition]
+# def find_edition_with_earliest_publication(editions: list[dict]) -> dict | None:
+#     """Find the edition with the earliest publication date."""
+#     print(
+#         f"Finding edition with earliest publication date from {len(editions)} editions"
+#     )
+#     earliest_publication_date = date(9999, 12, 31)
+#     earliest_editions = []
+#     for i, edition in enumerate(editions):
+#         print(f"Finding edition with earliest publication date from {len(editions)} editions: {i} {edition['title']}")
+#         if "publish_date" not in edition:
+#             continue
+#         publication_date = _parse_edtf_date(edition["publish_date"])
+#         if publication_date is None:
+#             continue
+#         # If the publication date shares the same year as the earliest publication date, add it to the list
+#         if publication_date.year == earliest_publication_date.year:
+#             earliest_editions.append(edition)
+#         # If the publication date is before the earliest publication date, replace the list with the new edition
+#         elif publication_date < earliest_publication_date:
+#             breakpoint()
+#             earliest_publication_date = publication_date
+#             earliest_editions = [edition]
 
-    # If no editions with valid dates found, return None
-    if len(earliest_editions) == 0:
-        return None
+#     # If no editions with valid dates found, return None
+#     if len(earliest_editions) == 0:
+#         return None
 
-    # Return the first edition that has a publisher and ISBN
-    for edition in earliest_editions:
-        if (
-            edition.get("publishers") is not None
-            and len(edition.get("publishers")) > 0
-            and (
-                edition.get("isbn_13") is not None or edition.get("isbn_10") is not None
-            )
-        ):
-            return edition
+#     # Return the first edition that has a publisher and ISBN
+#     for edition in earliest_editions:
+#         if (
+#             edition.get("publishers") is not None
+#             and len(edition.get("publishers")) > 0
+#             and (
+#                 edition.get("isbn_13") is not None or edition.get("isbn_10") is not None
+#             )
+#         ):
+#             return edition
 
-    # If there is no first edition that has a publisher and ISBN, return the first edition that has a publisher
-    for edition in earliest_editions:
-        if edition.get("publishers") is not None and len(edition.get("publishers")) > 0:
-            return edition
+#     # If there is no first edition that has a publisher and ISBN, return the first edition that has a publisher
+#     for edition in earliest_editions:
+#         if edition.get("publishers") is not None and len(edition.get("publishers")) > 0:
+#             return edition
 
-    # If there is no edition that has a publisher and ISBN, return the first edition
-    return earliest_editions[0]
+#     # If there is no edition that has a publisher and ISBN, return the first edition
+#     return earliest_editions[0]
 
 
 def get_processed_filenames(output_file: str) -> set[str]:
@@ -351,37 +332,154 @@ def get_processed_filenames(output_file: str) -> set[str]:
     return processed
 
 
+def _get_title_variations(
+    title: str, subtitle: str | None, series: str | None
+) -> list[str]:
+    title_variations = [title]
+    if subtitle:
+        title_variations.append(f"{title}: {subtitle}")
+    if series:
+        title_variations.append(f"{title} ({series})")
+        title_variations.append(f"{series}: {title}")
+    if subtitle and series:
+        title_variations.append(f"{title}: {subtitle} ({series})")
+    # If the title starts with, "The ", remove it
+    if title.lower().startswith("the "):
+        title_variations.append(title[4:])
+    # If the title starts with, "A ", remove it
+    if title.lower().startswith("a "):
+        title_variations.append(title[2:])
+    # If the title starts with, "An ", remove it
+    if title.lower().startswith("an "):
+        title_variations.append(title[3:])
+    return title_variations
+
+
+def _fuzzy_title_match(title_variations: list[str], target_title: str) -> bool:
+    return any(
+        fuzz.ratio(title_variation.lower(), target_title.lower()) >= 70
+        for title_variation in title_variations
+    )
+
+
+def _fuzzy_author_match(authors: list[str], target_author: str) -> bool:
+    for author in authors:
+        author_surname = author.split(" ")[-1].lower()
+        if author_surname in target_author.lower():
+            return True
+    return False
+
+
+def _is_copyright_renewed(
+    title_variations: list[str],
+    authors: list[str],
+    copyright_renewal_records: pd.DataFrame,
+) -> bool:
+    for index, row in copyright_renewal_records.iterrows():
+        if not isinstance(row["TITLE"], str):
+            row["TITLE"] = str(row["TITLE"])
+        if not isinstance(row["AUTHOR"], str):
+            row["AUTHOR"] = str(row["AUTHOR"])
+        if _fuzzy_title_match(title_variations, row["TITLE"]) and _fuzzy_author_match(
+            authors, row["AUTHOR"]
+        ):
+            return True
+    return False
+
+
+def _get_cc_license_code(title_variations: list[str]) -> str | None:
+    api_url = "https://wiki.creativecommons.org/api.php"
+    for title_variation in title_variations:
+        params = {
+            "action": "parse",
+            "format": "json",
+            "page": title_variation.replace(" ", "_"),
+            "prop": "text",
+        }
+        try:
+            response = requests.get(api_url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            html_text = data["parse"]["text"]["*"]
+            match = re.search(
+                r"https?://creativecommons\.org/licenses/([^/]+)/", html_text
+            )
+            if match:
+                license_code = match.group(1)
+                print(f"CC license code for {title_variation}: {license_code}")
+                return license_code
+            else:
+                continue
+        except Exception as e:
+            print(f"Error getting CC license code for {title_variation}: {e}")
+            continue
+    return None
+
+
+def impute_copyright_status(
+    title_variations: list[str],
+    authors: list[str],
+    first_publication_date: date,
+    copyright_renewal_records: pd.DataFrame,
+) -> str:
+    cc_license_code = _get_cc_license_code(title_variations)
+    if cc_license_code is not None:
+        return cc_license_code
+
+    public_domain_cutoff_year = date.today().year - 96  # Should be 1929
+
+    if first_publication_date is None:
+        return "unknown"
+    elif first_publication_date.year <= public_domain_cutoff_year:
+        return "public domain"
+    elif first_publication_date.year >= 1930 and first_publication_date.year <= 1963:
+        if _is_copyright_renewed(title_variations, authors, copyright_renewal_records):
+            return "all rights reserved"
+        else:
+            return "public domain"
+    else:
+        return "all rights reserved"
+
+
+def deduplicate_works(works: list[dict]) -> list[dict]:
+    """Deduplicate works by key."""
+    seen_keys = set()
+    deduplicated_works = []
+    for work in works:
+        if work["key"] in seen_keys:
+            continue
+        seen_keys.add(work["key"])
+        deduplicated_works.append(work)
+    return deduplicated_works
 
 
 def enrich_with_openlibrary(
-    metadata: OverallBookMetadata, debug: bool = False
+    metadata: OverallBookMetadata,
+    copyright_renewal_records: pd.DataFrame = None,
 ) -> OverallBookMetadata:
     """
     Enrich metadata with OpenLibrary data.
     Fetches the original version metadata and adds it to the metadata object.
     """
-    if not metadata.title or not metadata.author or len(metadata.author) == 0:
-        print(f"Skipping {metadata.filename} - missing title or author")
-        return metadata
-
-    print(f"Fetching original version metadata for {metadata.filename}...")
     try:
-        # Step 1: Try to fetch and filter works using extracted title and each author
-        works = None
-        for author_name in metadata.author:
-            works = fetch_and_filter_works(metadata.title, author_name, debug)
-            if works and len(works) > 0:
-                if debug:
-                    print(
-                        f"Works found using extracted title '{metadata.title}' and author '{author_name}': {len(works)}"
-                    )
-                break
+        works = []
+        # Step 1: Try to fetch and filter works using title variations and each author; if author is missing, then just use the title variations
+        if metadata.title is not None:
+            title_variations = _get_title_variations(
+                metadata.title, metadata.subtitle, metadata.series
+            )
 
-        if debug and (not works or len(works) == 0):
-            print(f"No works found using extracted title and authors")
+            works = fetch_works(title_variations, metadata.author)
+            print(f"Works fetched: {len(works)}")
+            works = deduplicate_works(works)
+            print(f"Works deduplicated: {len(works)}")
+            print(works)
+            works = filter_works(works, title_variations, metadata.author)
+            print(f"Works filtered: {len(works)}")
+            print(works)
 
-        # Step 2: If no works found, try to fetch title and author and then fetch works from ISBN
-        if not works or len(works) == 0:
+        # Step 2: If no works found, try to fetch title and author from ISBN and then fetch works
+        if len(works) == 0:
             # Collect all ISBNs (both ISBN-13 and ISBN-10)
             isbns = []
             if metadata.books3_version_metadata.isbn_13:
@@ -392,56 +490,65 @@ def enrich_with_openlibrary(
             # Try each ISBN until we find a match
             for isbn in isbns:
                 try:
-                    title, author = _fetch_title_and_author_by_isbn(isbn, debug)
+                    title, author = _fetch_title_and_author_by_isbn(isbn)
+                    title_variations = _get_title_variations(
+                        title, metadata.subtitle, metadata.series
+                    )
                     if title and author:
-                        works = fetch_and_filter_works(title, author, debug)
-                        if works and len(works) > 0:
-                            if debug:
-                                print(
-                                    f"Works found using title and author from ISBN '{isbn}': {len(works)}"
-                                )
+                        works = fetch_works(title_variations, [author])
+                        print(f"Works fetched: {len(works)}")
+                        works = deduplicate_works(works)
+                        print(f"Works deduplicated: {len(works)}")
+                        works = filter_works(works, title_variations, [author])
+                        print(f"Works filtered: {len(works)}")
+                        if len(works) > 0:
                             break
-                        else:
-                            if debug:
-                                print(
-                                    f"No works found using title and author from ISBN: {isbn}. Trying next ISBN."
-                                )
                 except Exception as e:
-                    if debug:
-                        print(f"Error fetching from ISBN {isbn}: {e}")
+                    continue
 
-        # Step 3: Get all work keys with earliest publication year
-        if works and len(works) > 0:
-            work_keys = find_work_keys_with_earliest_publication_year(works, debug)
-            if debug:
-                print(f"Work keys with earliest publication year: {work_keys}")
+        # Step 3: If no works still found, try to fetch title from filename and then fetch works
+        # breakpoint()
+        # if len(works) == 0:
+        #     title = metadata.filename.replace(".txt", "").replace("_", " ")
+        #     title_variations = _get_title_variations(
+        #         title, metadata.subtitle, metadata.series
+        #     )
+        #     works = fetch_works(title_variations, metadata.author, debug)
+        #     print(f"Works fetched: {len(works)}")
+        #     works = deduplicate_works(works)
+        #     print(f"Works deduplicated: {len(works)}")
+        #     works = filter_works(works, title_variations, metadata.author, debug)
+        #     print(f"Works filtered: {len(works)}")
+        #     if len(works) > 0:
+        #         print(f"Works found using title from filename '{title}': {len(works)}")
 
-            # Step 4: Fetch all editions from all work keys
+        # Step 4: Get all work keys with earliest publication year
+        if len(works) > 0:
+            # Step 5: Fetch all editions from all work keys
             all_editions = []
+            work_keys = select_work_keys_for_expansion(works)
             if work_keys:
                 for work_key in work_keys:
-                    if debug:
-                        print(f"Fetching editions for work key: {work_key}")
-                    editions = fetch_all_editions(work_key, debug=debug)
+                    editions = fetch_all_editions(work_key)
+
                     if editions:
                         all_editions.extend(editions)
-                        if debug:
-                            print(f"  Added {len(editions)} editions from this work")
-
-                if debug:
-                    print(f"Total editions found across all works: {len(all_editions)}")
 
                 if all_editions:
-                    # Step 5: Get edition with earliest publication date
+                    # Step 6: Get edition with earliest publication date
                     earliest_edition = find_edition_with_earliest_publication(
-                        all_editions, debug
+                        all_editions
                     )
-                    if debug:
-                        print(
-                            f"Earliest edition: {earliest_edition.get('title') if earliest_edition else None}"
-                        )
 
                     if earliest_edition:
+                        # Extract publication date first
+                        publication_date = (
+                            _parse_edtf_date(earliest_edition["publish_date"])
+                            if "publish_date" in earliest_edition
+                            and earliest_edition["publish_date"] is not None
+                            else None
+                        )
+
                         # Fill out original_version_metadata from the earliest edition
                         metadata.original_version_metadata = BookMetadata(
                             translator=None,  # TO-DO: Translator info not typically in OpenLibrary editions
@@ -457,15 +564,13 @@ def enrich_with_openlibrary(
                                 and earliest_edition["isbn_10"]
                                 else None
                             ),
-                            publication_date=(
-                                _parse_edtf_date(
-                                    earliest_edition["publish_date"], debug
-                                )
-                                if "publish_date" in earliest_edition
-                                and earliest_edition["publish_date"] is not None
-                                else None
+                            publication_date=publication_date,
+                            status=impute_copyright_status(
+                                title_variations,
+                                metadata.author,
+                                publication_date,
+                                copyright_renewal_records,
                             ),
-                            status=None,  # Status info not in OpenLibrary
                             publisher=(
                                 earliest_edition.get("publishers", [])
                                 if "publishers" in earliest_edition
@@ -497,7 +602,6 @@ def main():
     )
     parser.add_argument("--input_file", "-i", type=str, default=DEFAULT_INPUT_FILE)
     parser.add_argument("--output_file", "-o", type=str, default=DEFAULT_OUTPUT_FILE)
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument(
         "--limit", "-l", type=int, default=None, help="Process only first N entries"
     )
@@ -505,12 +609,10 @@ def main():
 
     input_file = args.input_file
     output_file = args.output_file
-    debug = args.debug
     limit = args.limit
 
-    # Download copyright renewals data
-    download_copyright_renewals_data()
-    copyright_renewals_data = load_copyright_renewals_data()
+    # Load copyright renewal records
+    copyright_renewal_records = pd.read_csv(COPYRIGHT_RENEWAL_RECORDS_FILE)
 
     # Read input file
     if not os.path.exists(input_file):
@@ -577,7 +679,9 @@ def main():
     ):
         try:
             # Enrich with OpenLibrary data
-            enriched_metadata = enrich_with_openlibrary(metadata, debug)
+            enriched_metadata = enrich_with_openlibrary(
+                metadata, copyright_renewal_records
+            )
 
             # Write to output file
             with open(output_file, "a") as f:

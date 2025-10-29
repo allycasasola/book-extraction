@@ -9,6 +9,9 @@ from tqdm import tqdm
 import random
 from datetime import date
 import json
+from utils import StatusType
+import requests
+from urllib.parse import urlencode
 
 # TODO: Search API using ISBN
 # TODO: Add better search for multiple authors
@@ -23,7 +26,7 @@ DEFAULT_OUTPUT_FILE = f"{os.getenv('DATA_DIR')}/books3_extracted_info.jsonl"
 OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = """
-You are a helpful assistant for bibliographic metadata extraction. You will be provided roughly the first 6,000 words and the last 2,500 words of a book. This first 6,000 words may include the title page, copyright page, preface, or introduction. The last 2,500 words may include the conclusion, appendix, afterword, credits, bibliography, or other relevant information. From this text, extract the following information as accurately as possible:
+You are a helpful assistant for bibliographic metadata extraction. You will be provided roughly the first words and the last words of a book. This first 6,000 words may include the title page, copyright page, preface, or introduction. The last 2,500 words may include the conclusion, appendix, afterword, credits, bibliography, or other relevant information. From this text, extract the following information as accurately as possible:
 - Main title: the book's main title (excluding the series name, edition notes, or subtitle, unless part of the main title)
 - Subtitle: the book's subtitle (if any)
 - Series: the book's series (if any)
@@ -43,17 +46,20 @@ Rules and disambiguation guidelines:
 - If you can only determine the year of publication from the text but not the month and day, set the publication date to the first day of that year. If you can determine the year and month but not the day, set the publication date to the first day of that month. If you can determine the year, month, and day, set the publication date to the exact date.
 """
 
-StatusType = Literal[
-    "all rights reserved",
-    "public domain",
-    "cc-by",
-    "cc-by-nc-sa",
-    "cc-by-nd",
-    "cc0",
-    "orphan work",
-    "government work",
-    "fair use",
-]
+TITLE_INFERENCE_PROMPT = """
+The filename for this book is: {filename}
+
+Based on this filename and the text provided, please infer the book's title. The filename often contains the title with underscores or other formatting. Use both the filename and any title information you can find in the text to determine the most accurate title. Extract all else normally.
+"""
+
+AUTHOR_MATCHING_PROMPT = """
+We have identified the title as: {title}
+
+The following authors have written works with this title according to OpenLibrary:
+{author_list}
+
+Please review the text and determine which of these authors (if any) wrote this specific book. Look for author names in the copyright page, title page, or any other mentions in the text. Return only the authors that you can confirm from the text. Extract all else normally.
+"""
 
 
 class BookMetadata(BaseModel):
@@ -90,6 +96,36 @@ class OverallBookMetadata(BaseModel):
     original_version_metadata: BookMetadata | None = None
 
 
+def fetch_authors_from_openlibrary(title: str, debug: bool = False) -> list[str]:
+    """Fetch all possible authors for works with the given title from OpenLibrary."""
+    params = {"title": title}
+    url = f"https://openlibrary.org/search.json?{urlencode(params)}&fields=author_name&limit=50"
+
+    if debug:
+        print(f"Fetching authors for title '{title}' from OpenLibrary...")
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        # Collect all unique author names
+        authors = set()
+        for work in data.get("docs", []):
+            if "author_name" in work:
+                authors.update(work["author_name"])
+
+        author_list = sorted(list(authors))
+        if debug:
+            print(f"Found {len(author_list)} unique authors: {author_list}")
+
+        return author_list
+    except Exception as e:
+        if debug:
+            print(f"Error fetching authors from OpenLibrary: {e}")
+        return []
+
+
 def get_processed_filenames(output_file: str) -> set[str]:
     """Read the output file and return a set of already processed filenames."""
     if not os.path.exists(output_file):
@@ -112,12 +148,22 @@ def get_processed_filenames(output_file: str) -> set[str]:
 
 
 def format_text(text, max_first_word_count, max_last_word_count):
+    words = text.split()
+
+    # Get first N words
+    first_words = words[:max_first_word_count]
+    first_text = " ".join(first_words)
+
+    # Get last N words
+    last_words = words[-max_last_word_count:]
+    last_text = " ".join(last_words)
+
     new_text = ""
     new_text += "START OF BEGINNING TEXT:\n"
-    new_text += text[:max_first_word_count]
+    new_text += first_text
     new_text += "\nEND OF BEGINNING TEXT\n"
     new_text += "START OF FINAL TEXT:\n"
-    new_text += text[-max_last_word_count:]
+    new_text += last_text
     new_text += "\nEND OF FINAL TEXT\n"
     return new_text
 
@@ -127,21 +173,23 @@ def extract_metadata(
 ):
     """
     Extract title, subtitle, series, author, and books3_version_metadata using ChatGPT.
+    Uses multi-pass extraction with fallback strategies.
     """
-    # Read and format the text
+    # Read and check the text
     with open(file_path, "r") as f:
-        text = f.read()
-    text = format_text(text, max_first_word_count, max_last_word_count)
+        original_text = f.read()
+
+    # Format the text with word limits
+    text = format_text(original_text, max_first_word_count, max_last_word_count)
 
     if debug:
+        print(f"Original text: {original_word_count} words")
         print(text)
 
-    if len(text) > MAX_FIRST_WORD_COUNT + MAX_LAST_WORD_COUNT + 100:
-        print(f"Text is too long: {len(text)} words. Skipping...")
-        return
+    filename = os.path.basename(file_path)
 
-    # Extract metadata using ChatGPT
-    print(f"Extracting metadata from {file_path} using ChatGPT...")
+    # PASS 1: Initial extraction
+    print(f"Pass 1: Extracting metadata from {file_path} using ChatGPT...")
     response = OPENAI_CLIENT.responses.parse(
         model=model,
         input=[
@@ -152,19 +200,78 @@ def extract_metadata(
     )
 
     if hasattr(response, "usage"):
-        # TODO: Track usage
         input_tokens = getattr(response.usage, "input_tokens", 0)
-        print(f"Input tokens: {input_tokens}")
+        print(f"  Input tokens: {input_tokens}")
         output_tokens = getattr(response.usage, "output_tokens", 0)
-        print(f"Output tokens: {output_tokens}")
+        print(f"  Output tokens: {output_tokens}")
 
     extracted = response.output_parsed
     if debug:
-        print(f"Extracted metadata from ChatGPT: {extracted}")
+        print(f"  Extracted metadata: {extracted}")
+
+    # PASS 2: If title is None, try again with filename hint
+    if extracted.title is None:
+        print(f"Pass 2: Title not found. Retrying with filename hint...")
+        filename_without_ext = filename.replace(".txt", "").replace("_", " ")
+        enhanced_prompt = (
+            TITLE_INFERENCE_PROMPT.format(filename=filename_without_ext) + "\n\n" + text
+        )
+
+        response = OPENAI_CLIENT.responses.parse(
+            model=model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": enhanced_prompt},
+            ],
+            text_format=ChatGPTExtraction,
+        )
+
+        extracted = response.output_parsed
+        if debug:
+            print(f"  Extracted metadata with filename hint: {extracted}")
+
+        if extracted.title:
+            print(f"  ✓ Title found: {extracted.title}")
+
+    # PASS 3: If author is None/empty but title exists, fetch candidates from OpenLibrary
+    if extracted.title and (not extracted.author or len(extracted.author) == 0):
+        print(
+            f"Pass 3: Author not found. Fetching candidate authors from OpenLibrary..."
+        )
+        candidate_authors = fetch_authors_from_openlibrary(extracted.title, debug)
+
+        if candidate_authors:
+            print(f"  Found {len(candidate_authors)} candidate authors")
+            author_list_str = "\n".join(f"- {author}" for author in candidate_authors)
+            enhanced_prompt = (
+                AUTHOR_MATCHING_PROMPT.format(
+                    title=extracted.title, author_list=author_list_str
+                )
+                + "\n\n"
+                + text
+            )
+
+            response = OPENAI_CLIENT.responses.parse(
+                model=model,
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": enhanced_prompt},
+                ],
+                text_format=ChatGPTExtraction,
+            )
+
+            extracted = response.output_parsed
+            if debug:
+                print(f"  Extracted metadata with author candidates: {extracted}")
+
+            if extracted.author and len(extracted.author) > 0:
+                print(f"  ✓ Author(s) found: {extracted.author}")
+        else:
+            print(f"  ✗ No candidate authors found in OpenLibrary")
 
     # Create OverallBookMetadata instance with extracted info
     overall_metadata = OverallBookMetadata(
-        filename=os.path.basename(file_path),
+        filename=filename,
         title=extracted.title,
         subtitle=extracted.subtitle,
         series=extracted.series,
@@ -185,7 +292,7 @@ def extract_metadata(
     with open(output_file, "a") as f:
         f.write(overall_metadata.model_dump_json() + "\n")
 
-    print(f"Saved metadata for {overall_metadata.filename}\n")
+    print(f"✓ Saved metadata for {overall_metadata.filename}\n")
 
 
 def main():
@@ -213,8 +320,6 @@ def main():
     max_last_word_count = args.max_last_word_count
     output_file = args.output_file
     debug = args.debug
-
-    print(f"Using API key: {os.getenv('OPENAI_API_KEY')}")
 
     # Get list of files
     all_files = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
